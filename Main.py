@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import collections
+import csv
 import pickle
 import sys
 import time
-from dataclasses import dataclass, field
+import signal
+import threading
+import queue
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +18,9 @@ import numpy as np
 
 try:
     from picamera2 import Picamera2
+    import libcamera
 except ImportError:
-    sys.exit("[ERROR] Picamera2 not found.")
+    sys.exit("[ERROR] Picamera2 / libcamera dependencies missing.")
 
 try:
     from hailo_platform import (
@@ -30,19 +35,19 @@ try:
         VDevice,
     )
 except ImportError:
-    sys.exit("[ERROR] hailo_platform not found. Activate/install HailoRT first.")
+    sys.exit("[ERROR] HailoRT components missing. Check Hat software initialization.")
 
-#  Paths 
-BASE_DIR            = Path("/home/dps/attendance/codes2/pratham1")
+# Paths Configuration
+BASE_DIR            = Path("/home/dps/attendance/pratham1")
+Path1               = BASE_DIR / "csv_files"
 DEFAULT_ENCODINGS   = BASE_DIR / "encodings.pkl"
 DEFAULT_SCRFD_HEF   = BASE_DIR / "models1" / "scrfd_2.5g_h8l.hef"      
 DEFAULT_ARCFACE_HEF = BASE_DIR / "models1" / "arcface_r50.hef"
 
-#  Constants 
+# Model Resolution Constants
 SCRFD_SIZE    = 640
 ARCFACE_SIZE  = 112
 SCRFD_STRIDES = (8, 16, 32)
-SMOOTH_FRAMES = 5
 
 REFERENCE_LANDMARKS = np.array(
     [
@@ -55,30 +60,22 @@ REFERENCE_LANDMARKS = np.array(
     dtype=np.float32,
 )
 
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    print("\n[SYSTEM] Intercepted termination payload. Clearing allocations...")
+    running = False
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 
 @dataclass
 class Face:
     box:       np.ndarray   
     landmarks: np.ndarray   
     score:     float        
-
-
-@dataclass
-class TrackedFace:
-    scores:     dict[str, collections.deque] = field(default_factory=dict)
-    last_name:  str   = "Unknown"
-    last_score: float = 0.0
-
-    def update(self, scores: dict[str, float], known_names: list[str]) -> None:
-        for name in known_names:
-            if name not in self.scores:
-                self.scores[name] = collections.deque(maxlen=SMOOTH_FRAMES)
-            self.scores[name].append(scores.get(name, 0.0))
-
-    def smoothed_scores(self) -> dict[str, float]:
-        if not self.scores:
-            return {}
-        return {name: float(np.mean(list(buf))) for name, buf in self.scores.items()}
 
 
 class HailoModel:
@@ -236,11 +233,9 @@ def decode_scrfd(outputs: dict[str, Any], score_thresh: float, nms_thresh: float
             box[[0, 2]] = np.clip(box[[0, 2]], 0, frame_w - 1)
             box[[1, 3]] = np.clip(box[[1, 3]], 0, frame_h - 1)
 
-            # Keep validation light to avoid skipping rotated faces live
             if not (np.any(lms < 0) or np.any(lms[:, 0] >= frame_w) or np.any(lms[:, 1] >= frame_h)):
                 faces.append(Face(box=box.astype(int), landmarks=lms, score=float(scores[idx])))
 
-    # Implement NMS
     if not faces: return []
     order = np.argsort([f.score for f in faces])[::-1]
     keep_faces: list[Face] = []
@@ -278,60 +273,35 @@ def extract_embedding(arcface: HailoModel, aligned_bgr: np.ndarray) -> np.ndarra
     feats = outputs.get("fc1") or next(iter(outputs.values()))
     feats = np.squeeze(np.asarray(feats, dtype=np.float32))
     
-    # Enforce unit normalization mapping
     norm = np.linalg.norm(feats)
     if norm > 1e-6:
         feats = feats / norm
     return feats
 
 
-class FaceSmoother:
-    def __init__(self) -> None:
-        self.tracks: list[TrackedFace] = []
-
-    def update(self, current_faces: list[Face], raw_scores_list: list[dict[str, float]], known_names: list[str]) -> list[tuple[Face, str, float, float]]:
-        new_tracks: list[TrackedFace] = []
-        results: list[tuple[Face, str, float, float]] = []
-
-        for face, scores in zip(current_faces, raw_scores_list):
-            best_track = None
-            best_iou   = 0.2
-
-            for t in self.tracks:
-                if hasattr(t, "last_box"):
-                    boxA, boxB = t.last_box, face.box
-                    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
-                    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
-                    inter = max(0, xB - xA) * max(0, yB - yA)
-                    ovr = inter / float((boxA[2]-boxA[0])*(boxA[3]-boxA[1]) + (boxB[2]-boxB[0])*(boxB[3]-boxB[1]) - inter + 1e-6)
-                    if ovr > best_iou:
-                        best_iou = ovr
-                        best_track = t
-
-            if best_track is None: best_track = TrackedFace()
-            best_track.update(scores, known_names)
-            best_track.last_box = face.box
-            new_tracks.append(best_track)
-
-            smoothed = best_track.smoothed_scores()
-            if smoothed:
-                sorted_identities = sorted(smoothed.items(), key=lambda x: x[1], reverse=True)
-                best_name, best_score = sorted_identities[0]
-                margin = (best_score - sorted_identities[1][1]) if len(sorted_identities) > 1 else best_score
-            else:
-                best_name, best_score, margin = "Unknown", 0.0, 0.0
-
-            results.append((face, best_name, best_score, margin))
-
-        self.tracks = new_tracks
-        return results
+def csv_writer_worker(io_queue: queue.Queue, output_path: Path, headers: list[str]):
+    while True:
+        data = io_queue.get()
+        if data is None:
+            break
+        rows_to_save = data
+        try:
+            with open(output_path, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(rows_to_save)
+        except Exception as e:
+            print(f"[IO ERROR] Failed asynchronous commit: {e}")
+        io_queue.task_done()
 
 
 def main() -> None:
+    global running
     parser = argparse.ArgumentParser()
-    parser.add_argument("--threshold", type=float, default=0.38, help="Cosine alignment threshold")
-    parser.add_argument("--min-margin", type=float, default=0.10, help="Confidence margin threshold")
-    parser.add_argument("--det-thresh", type=float, default=0.45, help="SCRFD object threshold")
+    # OPTIMIZATION: Minor score calibration adjustment for better dynamic classroom captures
+    parser.add_argument("--threshold", type=float, default=0.44, help="Cosine alignment threshold")
+    parser.add_argument("--min-margin", type=float, default=0.15, help="Confidence margin threshold")
+    parser.add_argument("--det-thresh", type=float, default=0.35, help="SCRFD object threshold (relaxed for distant tiny faces)")
     args = parser.parse_args()
 
     if not DEFAULT_ENCODINGS.exists():
@@ -339,76 +309,184 @@ def main() -> None:
 
     with DEFAULT_ENCODINGS.open("rb") as fh:
         known = pickle.load(fh)
-    known_names = list(known.keys())
+    known_names = sorted(list(known.keys()))
     print(f"[SYSTEM] Loaded Profiles: {known_names}")
+
+    db_embeddings_list = []
+    db_mapping_indices = []
+    for name_idx, name in enumerate(known_names):
+        for emb in known[name]:
+            db_embeddings_list.append(emb)
+            db_mapping_indices.append(name_idx)
+            
+    db_matrix = np.array(db_embeddings_list, dtype=np.float32)  
+    db_map = np.array(db_mapping_indices, dtype=int)
+
+    file_timestamp = datetime.now().strftime("%H.%M.%S__%Y.%m.%d_")
+    attendance_file = Path1 / f"attendance_{file_timestamp}.csv"
+
+    headers = ["Name", "Status"]
+    csv_rows = [[name, "Absent/Not Marked"] for name in known_names]
+
+    with open(attendance_file, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(csv_rows)
+    print(f"[SYSTEM] Generated session file: {attendance_file}")
+
+    io_queue = queue.Queue()
+    io_thread = threading.Thread(target=csv_writer_worker, args=(io_queue, attendance_file, headers), daemon=True)
+    io_thread.start()
+
+    marked_attendance: set[str] = set()
 
     scrfd    = HailoModel(DEFAULT_SCRFD_HEF, "uint8")
     arcface  = HailoModel(DEFAULT_ARCFACE_HEF, "uint8")
-    smoother = FaceSmoother()
 
     cam = Picamera2()
-    cfg = cam.create_video_configuration(main={"size": (1280, 720), "format": "RGB888"})
+    # OPTIMIZATION: Configure camera to pull complete native 12MP high-resolution stills
+    cfg = cam.create_still_configuration(main={"size": (4608, 2592), "format": "RGB888"})
     cam.configure(cfg)
     cam.start()
+    
+    try:
+        cam.set_controls({"AfMode": libcamera.controls.AfModeEnum.Manual, "LensPosition": 0.45})
+        print("[SYSTEM] Fixed hyperfocal focus locked matrix deployed.")
+    except Exception as ex:
+        print(f"[WARN] Focus override error: {ex}. Proceeding with stock logic.")
 
-    smooth_fps = 30.0
-    last_time  = time.time()
+    print("[SYSTEM] Interval-Driven Burst Mode active. Checking classroom every 5 seconds...")
 
     try:
-        while True:
+        while running:
+            start_tick = time.time()
+            
+            # Grab a high-density raw 12-Megapixel still artifact
             arr = cam.capture_array()
-            if arr is None: continue
+            if arr is None: 
+                continue
 
             frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
             fh_h, fh_w = frame.shape[:2]
 
-            tensor, scale, pad_x, pad_y = preprocess_scrfd(frame)
-            outputs = scrfd.run(tensor)
-            faces = decode_scrfd(outputs, args.det_thresh, 0.45, fh_w, fh_h, pad_x, pad_y, scale)
+            # OPTIMIZATION: 3x3 High-Density Matrix Tiling Pass (9 overlapping regions)
+            # Dividing 4608x2592 into a 3x3 matrix keeps each slice in a wide aspect ratio.
+            # This completely stops downscale pixel distortion for far away students.
+            w_step, h_step = fh_w // 3, fh_h // 3
+            overlap_x, overlap_y = 200, 150  # Wide margins to securely trap faces on boundaries
+            
+            tiles = []
+            for r in range(3):
+                for c in range(3):
+                    y_start = max(0, r * h_step - (overlap_y if r > 0 else 0))
+                    y_end   = min(fh_h, (r + 1) * h_step + (overlap_y if r < 2 else 0))
+                    x_start = max(0, c * w_step - (overlap_x if c > 0 else 0))
+                    x_end   = min(fh_w, (c + 1) * w_step + (overlap_x if c < 2 else 0))
+                    
+                    crop_segment = frame[y_start:y_end, x_start:x_end]
+                    tiles.append((crop_segment, x_start, y_start))
 
-            raw_scores_list = []
+            all_detected_faces = []
+
+            # Stream each tile through the Hailo accelerator
+            for tile_img, offset_x, offset_y in tiles:
+                if tile_img.size == 0:
+                    continue
+                th_h, th_w = tile_img.shape[:2]
+                tensor, scale, pad_x, pad_y = preprocess_scrfd(tile_img)
+                outputs = scrfd.run(tensor)
+                tile_faces = decode_scrfd(outputs, args.det_thresh, 0.45, th_w, th_h, pad_x, pad_y, scale)
+                
+                for face in tile_faces:
+                    face.box[0] += offset_x
+                    face.box[2] += offset_x
+                    face.box[1] += offset_y
+                    face.box[3] += offset_y
+                    face.landmarks[:, 0] += offset_x
+                    face.landmarks[:, 1] += offset_y
+                    all_detected_faces.append(face)
+
+            # Clean duplicate edge counts with a Non-Maximum Suppression filter
+            if len(all_detected_faces) > 1:
+                all_detected_faces.sort(key=lambda x: x.score, reverse=True)
+                filtered_faces = []
+                for f in all_detected_faces:
+                    keep = True
+                    for k in filtered_faces:
+                        xA, yA = max(f.box[0], k.box[0]), max(f.box[1], k.box[1])
+                        xB, yB = min(f.box[2], k.box[2]), min(f.box[3], k.box[3])
+                        inter = max(0, xB - xA) * max(0, yB - yA)
+                        a_area = (f.box[2]-f.box[0]) * (f.box[3]-f.box[1])
+                        b_area = (k.box[2]-k.box[0]) * (k.box[3]-k.box[1])
+                        if (inter / float(a_area + b_area - inter + 1e-6)) > 0.40:
+                            keep = False
+                            break
+                    if keep:
+                        filtered_faces.append(f)
+                faces = filtered_faces
+            else:
+                faces = all_detected_faces
+
+            file_needs_update = False
+
+            # Extract embeddings and cross-verify with database matrices
             for face in faces:
                 aligned = align_face(frame, face.landmarks)
                 emb = extract_embedding(arcface, aligned)
 
-                scores = {}
-                for name, centroid in known.items():
-                    scores[name] = float(np.dot(emb, centroid))
-                raw_scores_list.append(scores)
+                # High-speed matrix multiplication pass
+                all_similarities = np.dot(db_matrix, emb)
+                
+                best_name = "Unknown"
+                best_score = 0.0
+                second_score = 0.0
 
-            smoothed_results = smoother.update(faces, raw_scores_list, known_names)
-            now        = time.time()
-            smooth_fps = 0.9 * smooth_fps + 0.1 * (1.0 / max(now - last_time, 1e-6))
-            last_time  = now
+                for name_idx, name in enumerate(known_names):
+                    student_mask = (db_map == name_idx)
+                    max_sim = float(np.max(all_similarities[student_mask]))
+                    if max_sim > best_score:
+                        second_score = best_score
+                        best_score = max_sim
+                        best_name = name
+                    elif max_sim > second_score:
+                        second_score = max_sim
 
-            recognized_count = 0
-            for face, name, score, margin in smoothed_results:
-                display_name = name
-                if score < args.threshold or margin < args.min_margin:
-                    display_name = "Unknown"
-                else:
-                    recognized_count += 1
+                margin = best_score - second_score
+                
+                # Check threshold gate assignments
+                if best_score >= args.threshold and margin >= args.min_margin:
+                    if best_name not in marked_attendance:
+                        marked_attendance.add(best_name)
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"[BURST RECOGNIZED] Verified Match: {best_name} | Cosine Score: {best_score:.2f}")
+                        
+                        for row in csv_rows:
+                            if row[0] == best_name:
+                                row[1] = f"Present ({timestamp})"
+                                file_needs_update = True
+                                break
 
-                # Draw to view frame
-                x1, y1, x2, y2 = face.box
-                color = (50, 50, 240) if display_name == "Unknown" else (76, 230, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                lbl = f"{display_name} ({score:.2f})" if display_name != "Unknown" else "Unknown Face"
-                cv2.putText(frame, lbl, (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            if file_needs_update:
+                io_queue.put(list(csv_rows))
 
-            # Overlay stats HUD panel
-            cv2.rectangle(frame, (0, 0), (520, 70), (0, 0, 0), -1)
-            cv2.putText(frame, f"FPS: {smooth_fps:.1f} | Tracking: {len(faces)} faces", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 2)
-            cv2.putText(frame, f"Recognized: {recognized_count} | Match Limit: {args.threshold:.2f}", (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+            # OPTIMIZATION: Compute exact processing execution cost and sleep for the remainder of the 10-second interval
+            execution_cost = time.time() - start_tick
+            sleep_duration = max(0.1, 5.0 - execution_cost)
+            
+            # Non-blocking shutdown listener break inside downtime loops
+            for _ in range(int(sleep_duration * 20)):
+                if not running: 
+                    break
+                time.sleep(0.05)
 
-            cv2.imshow("Live Attendance Monitoring System", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
     finally:
-        cv2.destroyAllWindows()
+        print("[SYSTEM] Closing active peripheral instances...")
+        io_queue.put(None)  
+        io_thread.join(timeout=2.0)
+        cam.stop()
         scrfd.close()
         arcface.close()
-        cam.stop()
+        print("[SYSTEM] Deployment terminated cleanly.")
 
 
 if __name__ == "__main__":
